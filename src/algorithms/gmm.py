@@ -9,6 +9,7 @@ import gzip
 import csv
 import itertools
 from collections import namedtuple, defaultdict
+from pyspark import RDD
 
 GMMLocEstimate = namedtuple('LocEstimate', ['geo_coord', 'prob'])
 
@@ -264,7 +265,7 @@ def predict_probability_radius(gmm_model, radius, center_point):
     return total_prob
 
 
-def predict_user_gmm(sc, tweets_to_predict, fields, model, radius=None, predict_lower_bound=0):
+def predict_user_gmm(sc, tweets_to_predict, fields, model, radius=None, predict_lower_bound=0, num_partitions=5000):
     """
     Takes a set of tweets and for each user in those tweets it predicts a location
     Also returned are the probability of that prediction location being w/n 100 km of the true point
@@ -276,6 +277,7 @@ def predict_user_gmm(sc, tweets_to_predict, fields, model, radius=None, predict_
         model (dict): Dictionary of {word:(mixture.GMM, error)}
         radius (float): Distance from most likely point at which we should estimate containment probability (if not None)
         predict_lower_bound (float): Probability hreshold below which we should filter tweets
+        num_partitions (int): Number of partitions. Should be based on size of the data
 
     Returns:
         loc_est_by_user (RDD): An RDD of (id_str, GMMLocEstimate)
@@ -283,11 +285,16 @@ def predict_user_gmm(sc, tweets_to_predict, fields, model, radius=None, predict_
 
     model_bcast = sc.broadcast(model)
 
-    tweets_by_user = tweets_to_predict.rdd.filter(lambda row: row.user!=None)\
-                        .keyBy(lambda row: row.user.id_str).groupByKey()
+    # Handle case where input is Dataframe
+    if not isinstance(tweets_to_predict, RDD):
+        tweets_to_predict = tweets_to_predict.rdd
+
+    tweets_by_user = tweets_to_predict.filter(lambda row: row != None and row.user!=None and row.user.id_str !=None)\
+                        .map(lambda tweet: (tweet.user.id_str, tokenize_tweet(tweet, fields)))\
+                        .groupByKey(numPartitions=num_partitions)
 
     loc_est_by_user = tweets_by_user\
-        .mapValues(lambda tweets: list(itertools.chain(*[tokenize_tweet(tweet, fields) for tweet in tweets])))\
+        .mapValues(lambda tokens: list(itertools.chain(*tokens)))\
         .flatMapValues(lambda tokens: get_most_likely_point(tokens, model_bcast, radius=radius))\
         .filter(lambda (id_str, est_loc): est_loc.prob >= predict_lower_bound or radius is None)
 
@@ -370,73 +377,18 @@ def run_gmm_test(sc, sqlCtx, table_name, fields, model, where_clause=''):
     mean_error = np.mean(errors)
     print('Median Error', median_error)
     print('Mean Error: ', mean_error)
+
+    # calculate coverage
+    try:
+        coverage = len(errors)/float(num_vals)
+    except ZeroDivisionError:
+        coverage = np.nan
+
     # gather errors
-    final_results = {'median': median_error, 'mean': mean_error, 'coverage': len(errors)/float(num_vals),
+    final_results = {'median': median_error, 'mean': mean_error, 'coverage': coverage,
                      'num_locs': len(errors), 'fields': fields}
     return final_results
 
-
-def predict_country_gmm(tweets, bounding_boxes):
-    """
-    Take a set of estimates of user locations and estimate the country that user is in
-
-    Args:
-        tweets (pyspark.RDD): RDD of (id_str, LocEstimate)
-        bounding_boxes (list): list [(country_code, (min_lat, max_lat, min_lon, max_lon)),...]
-
-    Returns:
-        tweets (pyspark.RDD): An RDD of (id_str, [countries])
-    """
-    # Convert Bounding boxes to allow for more efficient lookups
-    bb_lookup_lat = defaultdict(set)
-    bb_lookup_lon = defaultdict(set)
-    for i, (cc, (min_lat, max_lat, min_lon, max_lon)) in enumerate(bounding_boxes):
-        for lon in range(int(math.floor(min_lon)), int(math.ceil(max_lon))):
-            bb_lookup_lon[lon].add(i)
-        for lat in range(int(math.floor(min_lat)), int(math.ceil(max_lat))):
-            bb_lookup_lat[lat].add(i)
-
-    # broadcast to make more efficient
-    bb_lookup_lat_bcast = sc.broadcast(bb_lookup_lat)
-    bb_lookup_lon_bcast = sc.broadcast(bb_lookup_lon)
-    bounding_boxes_bcast = sc.broadcast(bounding_boxes)
-
-    # Do country lookups and return an RDD that is (id_str, [country_codes])
-    return tweets.mapValues(lambda loc_estimate: _predict_country_using_lookup_gmm(loc_estimate,\
-                                                                              bb_lookup_lat_bcast,
-                                                                              bb_lookup_lon_bcast,
-                                                                              bounding_boxes_bcast))
-
-
-def _predict_country_using_lookup_gmm(loc_estimate, lat_dict, lon_dict, bounding_boxes):
-    """
-    Internal helper function that uses broadcast lookup tables to take a single location estimate and show
-        what country bounding boxes include that point
-
-    Args:
-        loc_estimate (GMMLocEstimate):
-        lat_dict (pyspark.Broadcast): broadcast dictionary {integer_lat:set([bounding_box_indexes containing this lat])}
-        lon_dict (pyspark.Broadcast): broadcast dictionary {integer_lon:set([bounding_box_indexes containing this lon])}
-        bounding_boxes (pyspark.Broadcast): broadcast list [(country_code, (min_lat, max_lat, min_lon, max_lon)),...]
-
-    Returns:
-        countries (list): List of potential countries containing the location estimate
-    """
-    lat = loc_estimate.geo_coord.lat
-    lon = loc_estimate.geo_coord.lon
-    countries = set()
-    potential_lats = lat_dict.value[math.floor(lat)]
-    potential_lons = lon_dict.value[math.floor(lon)]
-    intersection = potential_lats.intersection(potential_lons)
-    if len(intersection) == 0:
-        return []
-        #raise ValueError('uh oh')
-    else:
-        for index in intersection:
-            cc, (min_lat, max_lat, min_lon, max_lon) = bounding_boxes.value[index]
-            if min_lon < lon and lon < max_lon and min_lat < lat and lat < max_lat:
-                countries.add(cc)
-    return list(countries)
 
 
 def load_model(input_fname):
